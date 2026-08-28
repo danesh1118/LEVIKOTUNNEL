@@ -4,18 +4,23 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/danesh1118/LEVIKOTUNNEL/internal/utils"
+	"github.com/danesh1118/LEVIKOTUNNEL/internal/utils/handlers"
 	"github.com/danesh1118/LEVIKOTUNNEL/internal/utils/network"
 	"github.com/danesh1118/LEVIKOTUNNEL/internal/web"
+
 	"github.com/sirupsen/logrus"
+	"github.com/xtaci/smux"
 )
 
-type UdpTransport struct {
-	config          *UdpConfig
+type TcpMuxTransport struct {
+	config          *TcpMuxConfig
+	smuxConfig      *smux.Config
 	parentctx       context.Context
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -27,25 +32,43 @@ type UdpTransport struct {
 	loadConnections int32
 	controlFlow     chan struct{}
 }
-type UdpConfig struct {
-	RemoteAddr     string
-	Token          string
-	SnifferLog     string
-	TunnelStatus   string
-	RetryInterval  time.Duration
-	DialTimeOut    time.Duration
-	ConnPoolSize   int
-	WebPort        int
-	Sniffer        bool
-	AggressivePool bool
+
+type TcpMuxConfig struct {
+	RemoteAddr       string
+	Token            string
+	SnifferLog       string
+	TunnelStatus     string
+	Nodelay          bool
+	Sniffer          bool
+	KeepAlive        time.Duration
+	RetryInterval    time.Duration
+	DialTimeOut      time.Duration
+	MuxVersion       int
+	MaxFrameSize     int
+	MaxReceiveBuffer int
+	MaxStreamBuffer  int
+	ConnPoolSize     int
+	WebPort          int
+	AggressivePool   bool
+	MSS              int
+	SO_RCVBUF        int
+	SO_SNDBUF        int
 }
 
-func NewUDPClient(parentCtx context.Context, config *UdpConfig, logger *logrus.Logger) *UdpTransport {
+func NewMuxClient(parentCtx context.Context, config *TcpMuxConfig, logger *logrus.Logger) *TcpMuxTransport {
 	// Create a derived context from the parent context
 	ctx, cancel := context.WithCancel(parentCtx)
 
 	// Initialize the TcpTransport struct
-	client := &UdpTransport{
+	client := &TcpMuxTransport{
+		smuxConfig: &smux.Config{
+			Version:           config.MuxVersion,
+			KeepAliveInterval: 20 * time.Second,
+			KeepAliveTimeout:  40 * time.Second,
+			MaxFrameSize:      config.MaxFrameSize,
+			MaxReceiveBuffer:  config.MaxReceiveBuffer,
+			MaxStreamBuffer:   config.MaxStreamBuffer,
+		},
 		config:          config,
 		parentctx:       parentCtx,
 		ctx:             ctx,
@@ -61,17 +84,17 @@ func NewUDPClient(parentCtx context.Context, config *UdpConfig, logger *logrus.L
 	return client
 }
 
-func (c *UdpTransport) Start() {
+func (c *TcpMuxTransport) Start() {
 	if c.config.WebPort > 0 {
 		go c.usageMonitor.Monitor()
 	}
 
-	c.config.TunnelStatus = "Disconnected (UDP)"
+	c.config.TunnelStatus = "Disconnected (TCPMUX)"
 
 	go c.channelDialer()
 }
 
-func (c *UdpTransport) Restart() {
+func (c *TcpMuxTransport) Restart() {
 	if !c.restartMutex.TryLock() {
 		c.logger.Warn("client is already restarting")
 		return
@@ -114,15 +137,15 @@ func (c *UdpTransport) Restart() {
 
 }
 
-func (c *UdpTransport) channelDialer() {
-	c.logger.Info("attempting to establish a new control channel connection...")
+func (c *TcpMuxTransport) channelDialer() {
+	c.logger.Info("attempting to establish a new tcpmux control channel connection...")
 
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		default:
-			tunnelTCPConn, err := network.TcpDialer(c.ctx, c.config.RemoteAddr, "", c.config.DialTimeOut, 30, true, 3, 0, 0, 0)
+			tunnelConn, err := network.TcpDialer(c.ctx, c.config.RemoteAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 3, 0, 0, 0)
 			if err != nil {
 				c.logger.Errorf("channel dialer: %v", err)
 				time.Sleep(c.config.RetryInterval)
@@ -130,57 +153,56 @@ func (c *UdpTransport) channelDialer() {
 			}
 
 			// Sending security token
-			err = utils.SendBinaryTransportString(tunnelTCPConn, c.config.Token, utils.SG_Chan)
+			err = utils.SendBinaryTransportString(tunnelConn, c.config.Token, utils.SG_Chan)
 			if err != nil {
 				c.logger.Errorf("failed to send security token: %v", err)
-				tunnelTCPConn.Close()
+				tunnelConn.Close()
 				continue
 			}
 
 			// Set a read deadline for the token response
-			if err := tunnelTCPConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			if err := tunnelConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 				c.logger.Errorf("failed to set read deadline: %v", err)
-				tunnelTCPConn.Close()
+				tunnelConn.Close()
 				continue
 			}
-
 			// Receive response
-			message, _, err := utils.ReceiveBinaryTransportString(tunnelTCPConn)
+			message, _, err := utils.ReceiveBinaryTransportString(tunnelConn)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					c.logger.Warn("timeout while waiting for control channel response")
 				} else {
 					c.logger.Errorf("failed to receive control channel response: %v", err)
 				}
-				tunnelTCPConn.Close() // Close connection on error or timeout
+				tunnelConn.Close() // Close connection on error or timeout
 				time.Sleep(c.config.RetryInterval)
 				continue
 			}
 			// Resetting the deadline (removes any existing deadline)
-			tunnelTCPConn.SetReadDeadline(time.Time{})
+			tunnelConn.SetReadDeadline(time.Time{})
 
 			if message == c.config.Token {
-				c.controlChannel = tunnelTCPConn
+				c.controlChannel = tunnelConn
 				c.logger.Info("control channel established successfully")
 
-				c.config.TunnelStatus = "Connected (UDP)"
+				c.config.TunnelStatus = "Connected (TCPMux)"
 
 				go c.poolMaintainer()
 				go c.channelHandler()
 
 				return
-
 			} else {
 				c.logger.Errorf("invalid token received. Expected: %s, Received: %s. Retrying...", c.config.Token, message)
-				tunnelTCPConn.Close() // Close connection if the token is invalid
+				tunnelConn.Close() // Close connection if the token is invalid
 				time.Sleep(c.config.RetryInterval)
 				continue
 			}
 		}
 	}
+
 }
 
-func (c *UdpTransport) poolMaintainer() {
+func (c *TcpMuxTransport) poolMaintainer() {
 	for i := 0; i < c.config.ConnPoolSize; i++ { //initial pool filling
 		go c.tunnelDialer()
 	}
@@ -245,7 +267,7 @@ func (c *UdpTransport) poolMaintainer() {
 
 }
 
-func (c *UdpTransport) channelHandler() {
+func (c *TcpMuxTransport) channelHandler() {
 	msgChan := make(chan byte, 1000)
 
 	// Goroutine to handle the blocking ReceiveBinaryString
@@ -296,169 +318,98 @@ func (c *UdpTransport) channelHandler() {
 				go c.Restart()
 				return
 
-			case utils.SG_RTT:
-				err := utils.SendBinaryByte(c.controlChannel, utils.SG_RTT)
-				if err != nil {
-					c.logger.Error("failed to send RTT signal, restarting client: ", err)
-					go c.Restart()
-					return
-				}
-
 			default:
 				c.logger.Errorf("unexpected response from channel: %v.", msg)
 				go c.Restart()
 				return
 			}
+
 		}
 	}
 }
 
-func (c *UdpTransport) tunnelDialer() {
-	c.logger.Debugf("initiating new connection to tunnel server at %s", c.config.RemoteAddr)
+func (c *TcpMuxTransport) tunnelDialer() {
+	c.logger.Debugf("initiating new tunnel connection to address %s", c.config.RemoteAddr)
 
-	remoteAddr, err := net.ResolveUDPAddr("udp", c.config.RemoteAddr)
+	// Dial to the tunnel server
+	tunnelConn, err := network.TcpDialer(c.ctx, c.config.RemoteAddr, "", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS)
 	if err != nil {
-		c.logger.Error("failed to resolve tunnel address:", err)
-		return
-	}
+		c.logger.Errorf("tunnel server dialer: %v", err)
 
-	tunConn, err := net.DialUDP("udp", nil, remoteAddr)
-	if err != nil {
-		c.logger.Error("failed to connect to server:", err)
-		return
-	}
-
-	defer tunConn.Close()
-
-	done := make(chan struct{})
-
-	// Start handleTunnelConn in a goroutine
-	go func() {
-		c.handleTunnelConn(tunConn)
-		close(done) // Signal that handleTunnelConn is done
-	}()
-
-	// Wait for either handleTunnelConn to finish or the context to be done
-	select {
-	case <-done:
-	case <-c.ctx.Done():
-	}
-}
-
-func (c *UdpTransport) handleTunnelConn(tunConn *net.UDPConn) {
-	// Send token message to the server
-	_, err := tunConn.Write([]byte(c.config.Token))
-	if err != nil {
-		c.logger.Error("faliled to send token:", err)
 		return
 	}
 
 	// Increment active connections counter
 	atomic.AddInt32(&c.poolConnections, 1)
 
-	// Prepare a buffer to receive the server's response
-	buffer := make([]byte, 47) // maximum buffer requried for store in IPv6:Port format
-
-	for {
-		n, _, err := tunConn.ReadFromUDP(buffer)
-		if err != nil {
-			c.logger.Error("failed to receive response from server:", err)
-
-			atomic.AddInt32(&c.poolConnections, -1)
-
-			return
-		}
-
-		// Compare the received bytes with the expected SG_Ping message
-		if n == 1 && buffer[0] == utils.SG_Ping {
-			c.logger.Tracef("ping signal recieved for %s", tunConn.LocalAddr().String())
-			continue
-		}
-
-		port, remoteAddr, err := network.ResolveRemoteAddr(string(buffer[:n]))
-
-		// Decrement active connections after successful or failed connection
-		atomic.AddInt32(&c.poolConnections, -1)
-
-		if err != nil {
-			c.logger.Error("failed to find remote address:", err)
-			return
-		}
-
-		c.localDialer(remoteAddr, port, tunConn)
-
-		break
-	}
-
+	c.handleSession(tunnelConn)
 }
 
-func (c *UdpTransport) localDialer(remoteAddr string, port int, tunConn *net.UDPConn) {
-	remoteResolvedAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+func (c *TcpMuxTransport) handleSession(tunnelConn net.Conn) {
+	defer func() {
+		atomic.AddInt32(&c.poolConnections, -1)
+	}()
+
+	// SMUX server
+	session, err := smux.Server(tunnelConn, c.smuxConfig)
 	if err != nil {
-		c.logger.Error("failed to resolve remote address:", err)
+		c.logger.Errorf("failed to create mux session: %v", err)
 		return
 	}
 
-	// Dial the remote UDP server
-	remoteConn, err := net.DialUDP("udp", nil, remoteResolvedAddr)
-	if err != nil {
-		c.logger.Errorf("failed to dial remote UDP address: %v", err)
-	}
-
-	defer remoteConn.Close()
-
-	done := make(chan struct{})
-	c.logger.Debugf("start to copy from tunnel %s to local %s", tunConn.LocalAddr(), remoteAddr)
-	go func() {
-		c.udpCopy(remoteConn, tunConn, port)
-		done <- struct{}{}
-	}()
-
-	c.udpCopy(tunConn, remoteConn, port)
-
-	<-done
-
-}
-
-func (c *UdpTransport) udpCopy(srcConn, dstConn *net.UDPConn, port int) {
-	buf := make([]byte, 16*1024)
-	readTimeout := 60 * time.Second
-
 	for {
-		// Set the read deadline to 60 seconds from now
-		err := srcConn.SetReadDeadline(time.Now().Add(readTimeout))
-		if err != nil {
-			c.logger.Errorf("failed to set read deadline: %v", err)
+		select {
+		case <-c.ctx.Done():
 			return
-		}
-
-		// Read from the UDP source connection
-		n, _, err := srcConn.ReadFromUDP(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				c.logger.Debug("read from UDP timed out")
-				return // Exit on timeout
-			}
-			c.logger.Errorf("failed to read from UDP: %v", err)
-			return
-		}
-
-		totalWritten := 0
-		// Write the read data to the destination UDP connection
-		for totalWritten < n {
-			w, err := dstConn.Write(buf[totalWritten:n])
+		default:
+			stream, err := session.AcceptStream()
 			if err != nil {
-				c.logger.Errorf("failed to write to UDP %s: %v", dstConn.RemoteAddr().String(), err)
+				c.logger.Trace("session is closed: ", err)
+				session.Close()
 				return
 			}
-			totalWritten += w
-		}
 
-		// Optionally update the port usage stats if sniffing is enabled
-		if c.config.Sniffer {
-			c.usageMonitor.AddOrUpdatePort(port, uint64(totalWritten))
-		}
+			remoteAddr, err := utils.ReceiveBinaryString(stream)
+			if err != nil {
+				c.logger.Errorf("unable to get port from stream connection %s: %v", tunnelConn.RemoteAddr().String(), err)
+				stream.Close()
+				continue
+			}
 
-		c.logger.Debugf("forwarded %d bytes from %s to %s", n, srcConn.LocalAddr().String(), dstConn.RemoteAddr().String())
+			go c.localDialer(stream, remoteAddr)
+		}
 	}
+}
+
+func (c *TcpMuxTransport) localDialer(stream *smux.Stream, remoteAddr string) {
+	// Extract the port from the received address
+	port, resolvedAddr, err := network.ResolveRemoteAddr(remoteAddr)
+	if err != nil {
+		c.logger.Infof("failed to resolve remote port: %v", err)
+		stream.Close()
+		return
+	}
+
+	var sendBuf, recvBuf int
+
+	if strings.Contains(resolvedAddr, "127.0.0.1") {
+		// Use 32 KB for localhost
+		sendBuf = 32 * 1024
+		recvBuf = 32 * 1024
+	} else {
+		// Use your custom buffer sizes
+		sendBuf = c.config.SO_SNDBUF
+		recvBuf = c.config.SO_RCVBUF
+	}
+
+	localConnection, err := network.TcpDialer(c.ctx, resolvedAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 1, recvBuf, sendBuf, c.config.MSS)
+	if err != nil {
+		c.logger.Errorf("local dialer: %v", err)
+		stream.Close()
+		return
+	}
+
+	c.logger.Debugf("connected to local address %s successfully", remoteAddr)
+
+	handlers.TCPConnectionHandler(c.ctx, false, stream, localConnection, c.logger, c.usageMonitor, int(port), c.config.Sniffer)
 }

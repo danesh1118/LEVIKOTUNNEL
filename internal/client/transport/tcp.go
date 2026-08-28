@@ -4,18 +4,21 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/danesh1118/LEVIKOTUNNEL/internal/utils"
+	"github.com/danesh1118/LEVIKOTUNNEL/internal/utils/handlers"
 	"github.com/danesh1118/LEVIKOTUNNEL/internal/utils/network"
 	"github.com/danesh1118/LEVIKOTUNNEL/internal/web"
+
 	"github.com/sirupsen/logrus"
 )
 
-type UdpTransport struct {
-	config          *UdpConfig
+type TcpTransport struct {
+	config          *TcpConfig
 	parentctx       context.Context
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -27,25 +30,30 @@ type UdpTransport struct {
 	loadConnections int32
 	controlFlow     chan struct{}
 }
-type UdpConfig struct {
+type TcpConfig struct {
 	RemoteAddr     string
 	Token          string
 	SnifferLog     string
 	TunnelStatus   string
+	KeepAlive      time.Duration
 	RetryInterval  time.Duration
 	DialTimeOut    time.Duration
 	ConnPoolSize   int
 	WebPort        int
+	Nodelay        bool
 	Sniffer        bool
 	AggressivePool bool
+	MSS            int
+	SO_RCVBUF      int
+	SO_SNDBUF      int
 }
 
-func NewUDPClient(parentCtx context.Context, config *UdpConfig, logger *logrus.Logger) *UdpTransport {
+func NewTCPClient(parentCtx context.Context, config *TcpConfig, logger *logrus.Logger) *TcpTransport {
 	// Create a derived context from the parent context
 	ctx, cancel := context.WithCancel(parentCtx)
 
 	// Initialize the TcpTransport struct
-	client := &UdpTransport{
+	client := &TcpTransport{
 		config:          config,
 		parentctx:       parentCtx,
 		ctx:             ctx,
@@ -61,17 +69,16 @@ func NewUDPClient(parentCtx context.Context, config *UdpConfig, logger *logrus.L
 	return client
 }
 
-func (c *UdpTransport) Start() {
+func (c *TcpTransport) Start() {
 	if c.config.WebPort > 0 {
 		go c.usageMonitor.Monitor()
 	}
 
-	c.config.TunnelStatus = "Disconnected (UDP)"
+	c.config.TunnelStatus = "Disconnected (TCP)"
 
 	go c.channelDialer()
 }
-
-func (c *UdpTransport) Restart() {
+func (c *TcpTransport) Restart() {
 	if !c.restartMutex.TryLock() {
 		c.logger.Warn("client is already restarting")
 		return
@@ -111,10 +118,9 @@ func (c *UdpTransport) Restart() {
 	c.logger.SetLevel(level)
 
 	go c.Start()
-
 }
 
-func (c *UdpTransport) channelDialer() {
+func (c *TcpTransport) channelDialer() {
 	c.logger.Info("attempting to establish a new control channel connection...")
 
 	for {
@@ -122,7 +128,8 @@ func (c *UdpTransport) channelDialer() {
 		case <-c.ctx.Done():
 			return
 		default:
-			tunnelTCPConn, err := network.TcpDialer(c.ctx, c.config.RemoteAddr, "", c.config.DialTimeOut, 30, true, 3, 0, 0, 0)
+			//set default behaviour of control channel to nodelay, also using default buffer parameters
+			tunnelTCPConn, err := network.TcpDialer(c.ctx, c.config.RemoteAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 3, 0, 0, 0)
 			if err != nil {
 				c.logger.Errorf("channel dialer: %v", err)
 				time.Sleep(c.config.RetryInterval)
@@ -163,8 +170,7 @@ func (c *UdpTransport) channelDialer() {
 				c.controlChannel = tunnelTCPConn
 				c.logger.Info("control channel established successfully")
 
-				c.config.TunnelStatus = "Connected (UDP)"
-
+				c.config.TunnelStatus = "Connected (TCP)"
 				go c.poolMaintainer()
 				go c.channelHandler()
 
@@ -180,7 +186,7 @@ func (c *UdpTransport) channelDialer() {
 	}
 }
 
-func (c *UdpTransport) poolMaintainer() {
+func (c *TcpTransport) poolMaintainer() {
 	for i := 0; i < c.config.ConnPoolSize; i++ { //initial pool filling
 		go c.tunnelDialer()
 	}
@@ -245,7 +251,7 @@ func (c *UdpTransport) poolMaintainer() {
 
 }
 
-func (c *UdpTransport) channelHandler() {
+func (c *TcpTransport) channelHandler() {
 	msgChan := make(chan byte, 1000)
 
 	// Goroutine to handle the blocking ReceiveBinaryString
@@ -313,152 +319,76 @@ func (c *UdpTransport) channelHandler() {
 	}
 }
 
-func (c *UdpTransport) tunnelDialer() {
+// Dialing to the tunnel server, chained functions, without retry
+func (c *TcpTransport) tunnelDialer() {
 	c.logger.Debugf("initiating new connection to tunnel server at %s", c.config.RemoteAddr)
 
-	remoteAddr, err := net.ResolveUDPAddr("udp", c.config.RemoteAddr)
+	// Dial to the tunnel server
+	tcpConn, err := network.TcpDialer(c.ctx, c.config.RemoteAddr, "", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS)
 	if err != nil {
-		c.logger.Error("failed to resolve tunnel address:", err)
-		return
-	}
+		c.logger.Error("tunnel server dialer: ", err)
 
-	tunConn, err := net.DialUDP("udp", nil, remoteAddr)
-	if err != nil {
-		c.logger.Error("failed to connect to server:", err)
-		return
-	}
-
-	defer tunConn.Close()
-
-	done := make(chan struct{})
-
-	// Start handleTunnelConn in a goroutine
-	go func() {
-		c.handleTunnelConn(tunConn)
-		close(done) // Signal that handleTunnelConn is done
-	}()
-
-	// Wait for either handleTunnelConn to finish or the context to be done
-	select {
-	case <-done:
-	case <-c.ctx.Done():
-	}
-}
-
-func (c *UdpTransport) handleTunnelConn(tunConn *net.UDPConn) {
-	// Send token message to the server
-	_, err := tunConn.Write([]byte(c.config.Token))
-	if err != nil {
-		c.logger.Error("faliled to send token:", err)
 		return
 	}
 
 	// Increment active connections counter
 	atomic.AddInt32(&c.poolConnections, 1)
 
-	// Prepare a buffer to receive the server's response
-	buffer := make([]byte, 47) // maximum buffer requried for store in IPv6:Port format
+	// Attempt to receive the remote address from the tunnel server
+	remoteAddr, transport, err := utils.ReceiveBinaryTransportString(tcpConn)
 
-	for {
-		n, _, err := tunConn.ReadFromUDP(buffer)
-		if err != nil {
-			c.logger.Error("failed to receive response from server:", err)
+	// Decrement active connections after successful or failed connection
+	atomic.AddInt32(&c.poolConnections, -1)
 
-			atomic.AddInt32(&c.poolConnections, -1)
-
-			return
-		}
-
-		// Compare the received bytes with the expected SG_Ping message
-		if n == 1 && buffer[0] == utils.SG_Ping {
-			c.logger.Tracef("ping signal recieved for %s", tunConn.LocalAddr().String())
-			continue
-		}
-
-		port, remoteAddr, err := network.ResolveRemoteAddr(string(buffer[:n]))
-
-		// Decrement active connections after successful or failed connection
-		atomic.AddInt32(&c.poolConnections, -1)
-
-		if err != nil {
-			c.logger.Error("failed to find remote address:", err)
-			return
-		}
-
-		c.localDialer(remoteAddr, port, tunConn)
-
-		break
-	}
-
-}
-
-func (c *UdpTransport) localDialer(remoteAddr string, port int, tunConn *net.UDPConn) {
-	remoteResolvedAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
 	if err != nil {
-		c.logger.Error("failed to resolve remote address:", err)
+		c.logger.Debugf("failed to receive port from tunnel connection %s: %v", tcpConn.RemoteAddr().String(), err)
+		tcpConn.Close()
 		return
 	}
 
-	// Dial the remote UDP server
-	remoteConn, err := net.DialUDP("udp", nil, remoteResolvedAddr)
+	// Extract the port from the received address
+	port, resolvedAddr, err := network.ResolveRemoteAddr(remoteAddr)
 	if err != nil {
-		c.logger.Errorf("failed to dial remote UDP address: %v", err)
+		c.logger.Infof("failed to resolve remote port: %v", err)
+		tcpConn.Close() // Close the connection on error
+		return
 	}
 
-	defer remoteConn.Close()
+	switch transport {
+	case utils.SG_TCP:
+		// Dial local server using the received address
+		c.localDialer(tcpConn, resolvedAddr, port)
 
-	done := make(chan struct{})
-	c.logger.Debugf("start to copy from tunnel %s to local %s", tunConn.LocalAddr(), remoteAddr)
-	go func() {
-		c.udpCopy(remoteConn, tunConn, port)
-		done <- struct{}{}
-	}()
+	case utils.SG_UDP:
+		UDPDialer(tcpConn, resolvedAddr, c.logger, c.usageMonitor, port, c.config.Sniffer)
 
-	c.udpCopy(tunConn, remoteConn, port)
-
-	<-done
-
+	default:
+		c.logger.Error("undefined transport. close the connection.")
+		tcpConn.Close()
+	}
 }
 
-func (c *UdpTransport) udpCopy(srcConn, dstConn *net.UDPConn, port int) {
-	buf := make([]byte, 16*1024)
-	readTimeout := 60 * time.Second
+func (c *TcpTransport) localDialer(tcpConn net.Conn, resolvedAddr string, port int) {
+	var sendBuf, recvBuf int
 
-	for {
-		// Set the read deadline to 60 seconds from now
-		err := srcConn.SetReadDeadline(time.Now().Add(readTimeout))
-		if err != nil {
-			c.logger.Errorf("failed to set read deadline: %v", err)
-			return
-		}
-
-		// Read from the UDP source connection
-		n, _, err := srcConn.ReadFromUDP(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				c.logger.Debug("read from UDP timed out")
-				return // Exit on timeout
-			}
-			c.logger.Errorf("failed to read from UDP: %v", err)
-			return
-		}
-
-		totalWritten := 0
-		// Write the read data to the destination UDP connection
-		for totalWritten < n {
-			w, err := dstConn.Write(buf[totalWritten:n])
-			if err != nil {
-				c.logger.Errorf("failed to write to UDP %s: %v", dstConn.RemoteAddr().String(), err)
-				return
-			}
-			totalWritten += w
-		}
-
-		// Optionally update the port usage stats if sniffing is enabled
-		if c.config.Sniffer {
-			c.usageMonitor.AddOrUpdatePort(port, uint64(totalWritten))
-		}
-
-		c.logger.Debugf("forwarded %d bytes from %s to %s", n, srcConn.LocalAddr().String(), dstConn.RemoteAddr().String())
+	if strings.Contains(resolvedAddr, "127.0.0.1") {
+		// Use 32 KB for localhost
+		sendBuf = 32 * 1024
+		recvBuf = 32 * 1024
+	} else {
+		// Use your custom buffer sizes
+		sendBuf = c.config.SO_SNDBUF
+		recvBuf = c.config.SO_RCVBUF
 	}
+
+	localConnection, err := network.TcpDialer(c.ctx, resolvedAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 1, recvBuf, sendBuf, c.config.MSS)
+	if err != nil {
+		c.logger.Errorf("local dialer: %v", err)
+		tcpConn.Close()
+		return
+	}
+
+	c.logger.Debugf("connected to local address %s successfully", resolvedAddr)
+
+	handlers.TCPConnectionHandler(c.ctx, false, tcpConn, localConnection, c.logger, c.usageMonitor, port, c.config.Sniffer)
 }
