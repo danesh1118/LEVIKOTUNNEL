@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LEVIKO TUNNEL — Control Center</title>
+<style>
+:root{--bg:#07090d;--panel:#0d1118;--panel2:#111720;--line:#202936;--text:#f5f7fb;--muted:#7f8b9d;--accent:#d7ff3f;--accent2:#9ee51f;--good:#55e38b;--warn:#ffd166}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(90deg,transparent 49.9%,#ffffff03 50%),linear-gradient(#ffffff02 1px,transparent 1px);background-size:64px 64px;mask-image:linear-gradient(to bottom,#000,transparent 80%)}
+.shell{max-width:1280px;margin:auto;padding:22px}.topbar{height:66px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);margin-bottom:24px}
+.brand{display:flex;align-items:center;gap:12px}.logo{width:42px;height:42px;border-radius:12px;background:var(--accent);color:#080b0c;display:grid;place-items:center;font-weight:1000;letter-spacing:-.08em;box-shadow:0 0 28px #d7ff3f26}.brand b{font-size:17px;letter-spacing:.12em}.brand small{display:block;color:var(--muted);margin-top:2px}.tools{display:flex;gap:8px}button{background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:10px;padding:9px 12px;cursor:pointer}.layout{display:grid;grid-template-columns:210px 1fr;gap:22px}.side{border:1px solid var(--line);background:#0a0e14;border-radius:16px;padding:12px;height:max-content;position:sticky;top:16px}.side .cap{color:#536071;font-size:10px;letter-spacing:.15em;text-transform:uppercase;padding:10px}.nav{padding:11px 12px;border-radius:10px;color:var(--muted);margin:3px 0}.nav.active{background:#d7ff3f12;color:var(--accent);border:1px solid #d7ff3f25}.nav span{float:right;font-size:11px}.hero{display:flex;justify-content:space-between;gap:20px;align-items:flex-end;padding:24px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(135deg,#121820,#0c1016);margin-bottom:16px}.eyebrow{color:var(--accent);font-size:11px;letter-spacing:.18em;text-transform:uppercase}.hero h1{margin:7px 0 4px;font-size:31px;letter-spacing:-.04em}.hero p{margin:0;color:var(--muted)}.live{display:flex;align-items:center;gap:9px;padding:10px 13px;border:1px solid #55e38b35;border-radius:999px;color:var(--good);white-space:nowrap}.live i{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 12px var(--good)}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:17px;min-height:105px}.card .k{font-size:10px;text-transform:uppercase;letter-spacing:.13em;color:var(--muted)}.card .v{font-size:25px;font-weight:800;margin-top:10px;letter-spacing:-.03em}.wide{grid-column:span 2}.section{margin-top:16px}.section-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:9px}.section-head h2{font-size:14px;margin:0}.tag{font-size:10px;color:var(--muted);border:1px solid var(--line);padding:5px 8px;border-radius:999px}.table{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}.scroll{overflow:auto}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:13px 16px;border-bottom:1px solid var(--line)}th{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em}td{font-size:13px}tr:last-child td{border:0}.port{color:var(--accent);font-family:ui-monospace,monospace}.footer{padding:24px 0 5px;color:#566171;font-size:11px;display:flex;justify-content:space-between}.light{--bg:#f4f6f2;--panel:#fff;--panel2:#f7f9f5;--line:#d9ded5;--text:#131814;--muted:#667064}.light .side{background:#fff}.light .hero{background:#fff}
+@media(max-width:900px){.layout{grid-template-columns:1fr}.side{position:static;display:flex;overflow:auto;gap:5px}.side .cap{display:none}.nav{white-space:nowrap}.cards{grid-template-columns:repeat(2,1fr)}}@media(max-width:520px){.shell{padding:13px}.topbar{height:60px}.hero{align-items:flex-start;flex-direction:column}.hero h1{font-size:25px}.cards{grid-template-columns:1fr}.wide{grid-column:span 1}.footer{display:block}}
+</style>
+</head>
+<body>
+<div class="shell">
+<header class="topbar"><div class="brand"><div class="logo">L/T</div><div><b>LEVIKO TUNNEL</b><small>Private network control plane</small></div></div><div class="tools"><button id="refresh">↻ Refresh</button><button id="theme">◐</button></div></header>
+<div class="layout">
+<aside class="side"><div class="cap">Workspace</div><div class="nav active">Overview <span>01</span></div><div class="nav">Traffic <span>02</span></div><div class="nav">Ports <span>03</span></div><div class="nav">Runtime <span>04</span></div></aside>
+<main>
+<section class="hero"><div><div class="eyebrow">LEVIKO / CORE</div><h1>Tunnel Command Center</h1><p>Live infrastructure telemetry for your LEVIKO TUNNEL node.</p></div><div class="live"><i></i><span id="tunnel-status">CONNECTING</span></div></section>
+<section class="cards">
+<div class="card"><div class="k">CPU Load</div><div class="v" id="cpu-usage">—</div></div>
+<div class="card"><div class="k">Memory</div><div class="v" id="ram-usage">—</div></div>
+<div class="card"><div class="k">Disk</div><div class="v" id="disk-usage">—</div></div>
+<div class="card"><div class="k">Swap</div><div class="v" id="swap-usage">—</div></div>
+<div class="card wide"><div class="k">Network Traffic</div><div class="v" id="network-traffic">—</div></div>
+<div class="card wide"><div class="k">LEVIKO Traffic</div><div class="v" id="leviko-traffic">—</div></div>
+<div class="card"><div class="k">Download</div><div class="v" id="download-speed">—</div></div>
+<div class="card"><div class="k">Upload</div><div class="v" id="upload-speed">—</div></div>
+<div class="card"><div class="k">Connections</div><div class="v" id="all-connections">—</div></div>
+<div class="card"><div class="k">Sniffer</div><div class="v" id="sniffer">—</div></div>
+</section>
+<section class="section"><div class="section-head"><h2>PORT ACTIVITY</h2><span class="tag">LIVE TELEMETRY</span></div><div class="table"><div class="scroll"><table><thead><tr><th>Endpoint</th><th>Traffic Usage</th></tr></thead><tbody id="ports"><tr><td colspan="2">Loading telemetry…</td></tr></tbody></table></div></div></section>
+<div class="footer"><span>LEVIKO TUNNEL • Dedicated interface</span><span>v0.7.2</span></div>
+</main></div></div>
+<script>
+const $=x=>document.getElementById(x);
+async function stats(){try{let r=await fetch('/stats',{cache:'no-store'});if(!r.ok)throw 0;let s=await r.json();['tunnel-status','cpu-usage','ram-usage','disk-usage','swap-usage','network-traffic','leviko-traffic','download-speed','upload-speed','all-connections','sniffer'].forEach((id,i)=>$(id).textContent=[s.tunnelStatus,s.cpuUsage,s.ramUsage,s.diskUsage,s.swapUsage,s.networkTraffic,s.levikoTraffic,s.downloadSpeed,s.uploadSpeed,s.allConnections,s.sniffer][i]);}catch(e){$('tunnel-status').textContent='OFFLINE'}}
+async function ports(){try{let r=await fetch('/data',{cache:'no-store'});if(!r.ok)throw 0;let d=await r.json();$('ports').innerHTML=d&&d.length?d.map(x=>`<tr><td class="port">:${x.Port}</td><td>${x.ReadableUsage}</td></tr>`).join(''):'<tr><td colspan="2">No port telemetry available</td></tr>'}catch(e){$('ports').innerHTML='<tr><td colspan="2">Sniffer telemetry unavailable</td></tr>'}}
+function refresh(){stats();ports()}$('refresh').onclick=refresh;refresh();setInterval(refresh,3000);$('theme').onclick=()=>document.body.classList.toggle('light');
+</script>
+</body></html>
